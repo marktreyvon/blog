@@ -12,3 +12,4 @@ author: "markt"
 
 看图吧。
 
+![](https://raw.githubusercontent.com/marktreyvon/blog/master/image/major_courses.png)
